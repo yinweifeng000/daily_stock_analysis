@@ -601,20 +601,43 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return {}
 
     def _fetch_sector_fund_flow(self) -> Dict[str, float]:
-        """从 akshare 获取板块主力净流入（亿元），返回 {板块名称: 主力净流入(亿元)}；失败返回空 dict。"""
+        """从 akshare 获取板块主力净流入（亿元），返回 {板块名称: 主力净流入(亿元)}；失败返回空 dict。
+
+        注意：akshare 新版（>=1.13 左右）签名为 stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")，
+        旧版签名为 stock_sector_fund_flow_rank(indicator="行业")。此处先按新版签名调用，失败时回退旧版。
+        """
         result: Dict[str, float] = {}
         try:
             import akshare as ak
-            for indicator in ("行业", "概念"):
+
+            def _fetch_df(sector_type_new: str, sector_type_old: str):
                 try:
-                    df = ak.stock_sector_fund_flow_rank(indicator=indicator)
-                except Exception:
+                    return ak.stock_sector_fund_flow_rank(indicator="今日", sector_type=sector_type_new)
+                except (TypeError, KeyError, ValueError):
+                    return ak.stock_sector_fund_flow_rank(indicator=sector_type_old)
+
+            for sector_type_new, sector_type_old in (("行业资金流", "行业"), ("概念资金流", "概念")):
+                try:
+                    df = _fetch_df(sector_type_new, sector_type_old)
+                except Exception as e:
+                    logger.warning(
+                        "[大盘] %s action=fetch_sector_fund_flow sector=%s status=failed error=%s",
+                        self._log_context(), sector_type_new, e,
+                    )
                     continue
                 if df is None or df.empty:
+                    logger.warning(
+                        "[大盘] %s action=fetch_sector_fund_flow sector=%s status=empty",
+                        self._log_context(), sector_type_new,
+                    )
                     continue
-                name_col = '名称' if '名称' in df.columns else None
+                name_col = '名称' if '名称' in df.columns else next((c for c in df.columns if c in ('板块名称', '板块')), None)
                 net_col = next((c for c in df.columns if '主力净流入' in c and '净额' in c), None)
                 if not name_col or not net_col:
+                    logger.warning(
+                        "[大盘] %s action=fetch_sector_fund_flow sector=%s status=unexpected_columns columns=%s",
+                        self._log_context(), sector_type_new, list(df.columns),
+                    )
                     continue
                 for _, row in df.iterrows():
                     nm = str(row[name_col]).strip()
