@@ -1,0 +1,53 @@
+name: 每日政策扫描与宏观解读
+
+on:
+  # 北京时间每天 18:00（UTC 10:00）自动运行
+  schedule:
+    - cron: '0 10 * * *'
+  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: '强制运行（跳过任何前置检查）'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write   # 用于将生成的报告提交回仓库 policy_digest/
+
+jobs:
+  policy-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: 执行政策扫描与宏观解读
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
+          POLICY_FORCE: ${{ github.event.inputs.force_run }}
+        run: python policy_scan.py
+
+      - name: 上传报告产物（失败也可查）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-digest-${{ github.run_id }}
+          path: policy_digest/
+          if-no-files-found: ignore
