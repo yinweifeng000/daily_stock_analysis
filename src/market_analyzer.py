@@ -577,8 +577,59 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         return overview
 
     
+    def _fetch_index_amounts_from_akshare(self) -> Dict[str, float]:
+        """从 akshare 获取指数成交额（元），返回 {6位代码: 成交额(元)}；失败返回空 dict。"""
+        try:
+            import akshare as ak
+            df = ak.stock_zh_index_spot_em()
+            if df is None or df.empty:
+                return {}
+            code_col = '代码' if '代码' in df.columns else 'code'
+            amt_col = '成交额' if '成交额' in df.columns else 'amount'
+            if code_col not in df.columns or amt_col not in df.columns:
+                return {}
+            result: Dict[str, float] = {}
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip().zfill(6)
+                try:
+                    result[code] = float(row[amt_col])
+                except (TypeError, ValueError):
+                    continue
+            return result
+        except Exception as e:
+            logger.warning("[大盘] %s action=fetch_index_amounts status=failed error=%s", self._log_context(), e)
+            return {}
+
+    def _fetch_sector_fund_flow(self) -> Dict[str, float]:
+        """从 akshare 获取板块主力净流入（亿元），返回 {板块名称: 主力净流入(亿元)}；失败返回空 dict。"""
+        result: Dict[str, float] = {}
+        try:
+            import akshare as ak
+            for indicator in ("行业", "概念"):
+                try:
+                    df = ak.stock_sector_fund_flow_rank(indicator=indicator)
+                except Exception:
+                    continue
+                if df is None or df.empty:
+                    continue
+                name_col = '名称' if '名称' in df.columns else None
+                net_col = next((c for c in df.columns if '主力净流入' in c and '净额' in c), None)
+                if not name_col or not net_col:
+                    continue
+                for _, row in df.iterrows():
+                    nm = str(row[name_col]).strip()
+                    try:
+                        val = float(row[net_col]) / 1e8  # 元 -> 亿元
+                    except (TypeError, ValueError):
+                        continue
+                    if nm:
+                        result[nm] = result.get(nm, 0.0) + val
+        except Exception as e:
+            logger.warning("[大盘] %s action=fetch_sector_fund_flow status=failed error=%s", self._log_context(), e)
+        return result
+
     def _get_main_indices(self) -> List[MarketIndex]:
-        """获取主要指数实时行情"""
+        """获取主要指数实时行情（成交额由 akshare 补充）"""
         indices = []
 
         try:
@@ -586,9 +637,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
             # 使用 DataFetcherManager 获取指数行情（按 region 切换）
             data_list = self.data_manager.get_main_indices(region=self.region)
+            amount_map = self._fetch_index_amounts_from_akshare() if self.region == "cn" else {}
 
             if data_list:
                 for item in data_list:
+                    code = str(item.get('code', '')).strip()
+                    numeric_code = ''.join(filter(str.isdigit, code))[-6:] if code else ''
                     index = MarketIndex(
                         code=item['code'],
                         name=item['name'],
@@ -600,7 +654,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                         low=item['low'],
                         prev_close=item['prev_close'],
                         volume=item['volume'],
-                        amount=item['amount'],
+                        amount=item.get('amount') or amount_map.get(numeric_code, 0.0),
                         amplitude=item['amplitude']
                     )
                     indices.append(index)
@@ -658,6 +712,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
             top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5)
 
+            flow_map = self._fetch_sector_fund_flow()
+            for s in (top_sectors or []) + (bottom_sectors or []):
+                if isinstance(s, dict) and s.get('name'):
+                    s['main_net_inflow'] = flow_map.get(s['name'])
+
             if top_sectors or bottom_sectors:
                 overview.top_sectors = top_sectors
                 overview.bottom_sectors = bottom_sectors
@@ -680,6 +739,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             logger.info("[大盘] %s action=get_concept_rankings status=start", self._log_context())
 
             top_concepts, bottom_concepts = self.data_manager.get_concept_rankings(5)
+
+            flow_map = self._fetch_sector_fund_flow()
+            for s in (top_concepts or []) + (bottom_concepts or []):
+                if isinstance(s, dict) and s.get('name'):
+                    s['main_net_inflow'] = flow_map.get(s['name'])
 
             if top_concepts or bottom_concepts:
                 overview.top_concepts = top_concepts
@@ -1347,32 +1411,31 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         return reasons[:4]
 
     def _build_indices_block(self, overview: MarketOverview) -> str:
-        """构建指数行情表格"""
+        """构建指数行情块（移动端友好：每个指数一行，含成交额）"""
         if not overview.indices:
             return ""
-        if self._get_review_language() == "en":
-            lines = [
-                f"| Index | Last | Change % | Open | High | Low | Amplitude | Turnover ({self._get_turnover_unit_label()}) |",
-                "|-------|------|----------|------|------|-----|-----------|-----------------|",
-            ]
-        else:
-            lines = [
-                "| 指数 | 最新 | 涨跌幅 | 开盘 | 最高 | 最低 | 振幅 | 成交额(亿) |",
-                "|------|------|--------|------|------|------|------|-----------|",
-            ]
+        is_en = self._get_review_language() == "en"
+        unit = self._get_turnover_unit_label()
+        lines = []
         for idx in overview.indices:
             arrow = self._get_index_change_arrow(idx.change_pct)
-            amount_raw = idx.amount or 0.0
-            amount_str = self._format_turnover_value(amount_raw)
-            lines.append(
-                f"| {idx.name} | {idx.current:.2f} | {arrow} {idx.change_pct:+.2f}% | "
-                f"{self._format_optional_number(idx.open)} | {self._format_optional_number(idx.high)} | "
-                f"{self._format_optional_number(idx.low)} | {self._format_optional_pct(idx.amplitude)} | {amount_str} |"
-            )
+            amount_str = self._format_turnover_value(idx.amount or 0.0)
+            amount_disp = f"{amount_str}{unit}" if amount_str != "N/A" else "N/A"
+            amp = self._format_optional_pct(idx.amplitude)
+            if is_en:
+                lines.append(
+                    f"- **{idx.name}**: {idx.current:.2f} | {arrow} {idx.change_pct:+.2f}% "
+                    f"| Amp {amp} | Turnover {amount_disp}"
+                )
+            else:
+                lines.append(
+                    f"- **{idx.name}**：{idx.current:.2f}　{arrow} {idx.change_pct:+.2f}%　"
+                    f"振幅 {amp}　成交额 {amount_disp}"
+                )
         return "\n".join(lines)
 
     def _build_sector_block(self, overview: MarketOverview) -> str:
-        """Build industry and concept ranking blocks."""
+        """Build industry and concept ranking blocks (with main net inflow)."""
         if (
             not overview.top_sectors
             and not overview.bottom_sectors
@@ -1383,6 +1446,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         lines = []
         language = self._get_review_language()
 
+        def _fmt_flow(value):
+            if value is None:
+                return "—"
+            sign = "▲" if value >= 0 else "▼"
+            return f"{sign} {abs(value):.2f}亿"
+
         def append_ranking(title: str, name_label: str, rows: List[Dict]) -> None:
             if not rows:
                 return
@@ -1390,12 +1459,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 lines.append("")
             lines.extend([
                 title,
-                f"| {'Rank' if language == 'en' else '排名'} | {name_label} | {'Change' if language == 'en' else '涨跌幅'} |",
-                "|------|------|--------|",
+                f"| {'Rank' if language == 'en' else '排名'} | {name_label} | {'Change' if language == 'en' else '涨跌幅'} | {'Net Inflow' if language == 'en' else '主力净流入'} |",
+                "|------|------|--------|----------|",
             ])
             for rank, item in enumerate(rows[:5], 1):
                 lines.append(
-                    f"| {rank} | {item.get('name', '-')} | {self._format_signed_pct(item.get('change_pct'))} |"
+                    f"| {rank} | {item.get('name', '-')} | {self._format_signed_pct(item.get('change_pct'))} | {_fmt_flow(item.get('main_net_inflow'))} |"
                 )
 
         if language == "en":
