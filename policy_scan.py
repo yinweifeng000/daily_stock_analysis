@@ -54,11 +54,6 @@ MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3-flash-preview").strip()
 # Gemini 接口基地址（中转网关可覆盖）。默认官方地址；地区受限无法直连时改为中转网关地址，
 # 例如 https://你的网关域名/v1beta 。接口路径与官方一致，googleSearch 联网检索同样可用。
 GEMINI_BASE_URL = (os.environ.get("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
-# 备选模型（按优先级）：仅保留 Google 仍在线、对 new users 可用的模型。
-# 注：gemini-2.5-flash / 2.5-pro / 1.5-flash 已对 new users 下架（404），故不再列入。
-MODEL_FALLBACKS = [m for m in [
-    "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-flash-latest",
-] if m and m != MODEL]
 
 GEN_DATE = datetime.date.today().strftime("%Y-%m-%d")
 GEN_DATE_CN = f"{GEN_DATE}（北京时间）"
@@ -102,55 +97,55 @@ def call_gemini(prompt: str) -> str:
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192, "topP": 0.95},
     }
     data = json.dumps(body).encode("utf-8")
-    # 依次尝试主模型与备选模型；每个模型在多个 key 间轮换，429 限流时退避重试
-    candidates = [MODEL] + MODEL_FALLBACKS
+    # 只调用配置的单个模型（MODEL），不再做多模型降级链——在免费档/限流时，
+    # 多模型重试只会把本就紧张的额度快速打光。仅在 429 限流时做有限退避重试。
     last_err = None
     last_quota = False
-    for model in candidates:
-        for ki, key in enumerate(keys):
-            url = f"{GEMINI_BASE_URL}/models/{model}:generateContent?key={key}"
-            for attempt in range(1, 5):
+    for ki, key in enumerate(keys):
+        url = f"{GEMINI_BASE_URL}/models/{MODEL}:generateContent?key={key}"
+        for attempt in range(1, 3):  # 最多 2 次尝试（含 1 次退避），省着用额度
+            try:
+                req = urllib.request.Request(
+                    url, data=data, headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    obj = json.loads(resp.read().decode("utf-8"))
+                parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    print(f"[policy_scan] 模型 {MODEL}（key#{ki + 1}）生成成功")
+                    return text
+                raise RuntimeError("Gemini 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
+            except urllib.error.HTTPError as e:
+                detail = ""
                 try:
-                    req = urllib.request.Request(
-                        url, data=data, headers={"Content-Type": "application/json"}
-                    )
-                    with urllib.request.urlopen(req, timeout=180) as resp:
-                        obj = json.loads(resp.read().decode("utf-8"))
-                    parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    text = "".join(p.get("text", "") for p in parts).strip()
-                    if text:
-                        print(f"[policy_scan] 模型 {model}（key#{ki + 1}）生成成功")
-                        return text
-                    raise RuntimeError("Gemini 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
-                except urllib.error.HTTPError as e:
-                    detail = ""
-                    try:
-                        detail = e.read().decode("utf-8", errors="replace")[:800]
-                    except Exception:
-                        pass
-                    last_err = f"HTTP {e.code}: {detail}"
-                    print(f"[policy_scan] 模型 {model}（key#{ki + 1}）第 {attempt} 次失败: HTTP {e.code} {detail}", file=sys.stderr)
-                    if e.code == 429:
-                        # 配额/限流：换下一个 key；若是最后一个 key 则退避后重试
-                        last_quota = True
-                        if ki < len(keys) - 1:
-                            break
-                        time.sleep(min(60, 10 * attempt))
-                        continue
-                    if 400 <= e.code < 500:
-                        # key 无效 / 模型不存在：换模型（同 key 重试无意义）
+                    detail = e.read().decode("utf-8", errors="replace")[:800]
+                except Exception:
+                    pass
+                last_err = f"HTTP {e.code}: {detail}"
+                print(f"[policy_scan] 模型 {MODEL}（key#{ki + 1}）第 {attempt} 次失败: HTTP {e.code} {detail}", file=sys.stderr)
+                if e.code == 429:
+                    # 配额/限流：标记后尝试下一个 key；若已是最后一个 key，则退避一次再试
+                    last_quota = True
+                    if ki < len(keys) - 1:
                         break
-                    # 5xx 等服务端错误：退避重试
-                    time.sleep(min(30, 5 * attempt))
+                    time.sleep(30)
                     continue
-                except Exception as e:  # noqa: BLE001
-                    last_err = e
-                    print(f"[policy_scan] 模型 {model}（key#{ki + 1}）第 {attempt} 次失败: {e}", file=sys.stderr)
-                    time.sleep(min(30, 5 * attempt))
-                    continue
-        # 该模型所有 key 均失败，尝试下一个模型
-    hint = "（疑似 Gemini API 配额耗尽 429，请等待配额重置或更换/升级 API Key）" if last_quota else ""
-    raise RuntimeError(f"Gemini 调用失败（已尝试模型 {candidates}，key 数 {len(keys)}）: {last_err} {hint}")
+                if 400 <= e.code < 500:
+                    # key 无效 / 模型不存在等客户端错误：重试无意义，直接报错
+                    raise RuntimeError(
+                        f"Gemini 客户端错误（请检查 GEMINI_API_KEY / GEMINI_MODEL / GEMINI_BASE_URL）: {last_err}"
+                    )
+                # 5xx 等服务端错误：退避后重试
+                time.sleep(min(20, 5 * attempt))
+                continue
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"[policy_scan] 模型 {MODEL}（key#{ki + 1}）第 {attempt} 次失败: {e}", file=sys.stderr)
+                time.sleep(min(20, 5 * attempt))
+                continue
+    hint = "（疑似 Gemini API 配额耗尽 429，请等待配额重置或更换/升级 API Key；免费档额度有限，建议改用 DeepSeek/硅基流动/智谱等免费渠道）" if last_quota else ""
+    raise RuntimeError(f"Gemini 调用失败（模型 {MODEL}，key 数 {len(keys)}）: {last_err} {hint}")
 
 
 def push_wechat(title: str, content: str) -> str:
