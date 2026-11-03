@@ -628,13 +628,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 except (TypeError, KeyError, ValueError):
                     return ak.stock_sector_fund_flow_rank(indicator=sector_type_old)
 
-            # 兼容更多签名组合（部分 akshare 版本对 sector_type 取值不同）
+            # 兼容更多签名组合（部分 akshare 版本对 sector_type 取值不同）。
+            # 注意：_fetch_df 内部已含旧签名回退，勿再追加 ("行业","行业") 之类重复组合，
+            # 否则一旦新旧签名同时可用会导致同一板块净流入被累加两次。
             combos = [
                 ("行业资金流", "行业"),
                 ("概念资金流", "概念"),
                 ("地域资金流", "地域"),
-                ("行业", "行业"),
-                ("概念", "概念"),
             ]
             for sector_type_new, sector_type_old in combos:
                 try:
