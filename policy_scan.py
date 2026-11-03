@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日政策扫描与宏观解读 (GitHub Action 版, OpenAI 兼容)
+每日政策扫描与宏观解读 (GitHub Action 版)
 ================================================
-- 使用 OpenAI 兼容接口 + web_search 实时检索 8 大部委官网政策 + 全球事件/科学论文/国际政策
+- 使用 Gemini + Google Search 实时检索 8 大部委官网政策 + 全球事件/科学论文/国际政策
 - 三视角深度解读：资深交易员 / 宏观经济分析师 / 公司基本面研究员
 - 输出落盘 policy_digest/YYYY-MM-DD.md
 - 精简摘要推送微信 (PushPlus)
 
-依赖：仅标准库（使用 urllib，无需 requests）
+依赖：仅标准库 + requests（已在仓库 requirements.txt 中）
 环境变量：
-  OPENAI_API_KEY    (必填，OpenAI 或任意 OpenAI 兼容网关的 key)
-  OPENAI_API_KEYS   (选填，多个 key 逗号分隔，429 限流时自动轮换)
-  OPENAI_BASE_URL   (选填，接口基地址；默认 https://api.openai.com/v1
-                   想接 DeepSeek/通义/Kimi 等国内模型时，填它们的 OpenAI 兼容地址，
-                   例如 https://api.deepseek.com/v1)
-  OPENAI_MODEL     (选填，默认 gpt-4o-mini-search-preview；
-                   需支持 web search 的模型，否则退化为仅用模型自身知识)
+  GEMINI_API_KEY    (必填，复用股票分析 Action 的同名 secret)
+  GEMINI_API_KEYS   (选填，多个 key 逗号分隔，429 限流时自动轮换)
   PUSHPLUS_TOKEN    (选填，填了就推微信；不填则只落盘)
   PUSHPLUS_TOPIC    (选填，一对多群组编码；填了则推给整个群组而非仅 token 本人)
+  GEMINI_MODEL     (选填，默认 gemini-3-flash-preview，需支持 googleSearch grounding)
+  GEMINI_BASE_URL  (选填，中转网关地址；默认官方 https://generativelanguage.googleapis.com/v1beta
+                   地区受限（如中国大陆）无法直连官方时，可填 Gemini 兼容中转网关，
+                   接口格式与官方一致，googleSearch 联网检索仍可正常工作)
   POLICY_FORCE      (选填，任意非空则视为手动触发，即使非交易日也跑)
 """
 
@@ -42,18 +41,24 @@ SITES = [
     ("中央人民政府", "https://www.gov.cn"),
 ]
 
-OPENAI_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
-# 支持多个 key 轮换（环境变量 OPENAI_API_KEYS，逗号分隔），在 429 限流时自动切换
-_KEYS_RAW = (os.environ.get("OPENAI_API_KEYS") or "").strip()
-OPENAI_KEYS_LIST = [k.strip() for k in _KEYS_RAW.split(",") if k.strip()] if _KEYS_RAW else []
-if not OPENAI_KEY and OPENAI_KEYS_LIST:
-    OPENAI_KEY = OPENAI_KEYS_LIST[0]
+GEMINI_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
+# 支持多个 key 轮换（环境变量 GEMINI_API_KEYS，逗号分隔），在 429 限流时自动切换
+_KEYS_RAW = (os.environ.get("GEMINI_API_KEYS") or "").strip()
+GEMINI_KEYS_LIST = [k.strip() for k in _KEYS_RAW.split(",") if k.strip()] if _KEYS_RAW else []
+if not GEMINI_KEY and GEMINI_KEYS_LIST:
+    GEMINI_KEY = GEMINI_KEYS_LIST[0]
 
 PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 PUSHPLUS_TOPIC = (os.environ.get("PUSHPLUS_TOPIC") or "").strip()  # 一对多群组编码；不填则推给 token 本人
-MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini-search-preview").strip()
-# OpenAI 兼容接口基地址；默认官方；可改为任意 OpenAI 兼容网关（DeepSeek/通义/Kimi 等）
-BASE_URL = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
+MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3-flash-preview").strip()
+# Gemini 接口基地址（中转网关可覆盖）。默认官方地址；地区受限无法直连时改为中转网关地址，
+# 例如 https://你的网关域名/v1beta 。接口路径与官方一致，googleSearch 联网检索同样可用。
+GEMINI_BASE_URL = (os.environ.get("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
+# 备选模型（按优先级）：仅保留 Google 仍在线、对 new users 可用的模型。
+# 注：gemini-2.5-flash / 2.5-pro / 1.5-flash 已对 new users 下架（404），故不再列入。
+MODEL_FALLBACKS = [m for m in [
+    "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-flash-latest",
+] if m and m != MODEL]
 
 GEN_DATE = datetime.date.today().strftime("%Y-%m-%d")
 GEN_DATE_CN = f"{GEN_DATE}（北京时间）"
@@ -68,7 +73,7 @@ def build_prompt() -> str:
 # 每日政策扫描与宏观解读 · {GEN_DATE}
 
 ## 一、国内政策扫描与三视角解读
-请使用联网搜索（web search），逐一检索以下 8 个官方网站「今天（{GEN_DATE}）新发布/新出台」的政策、通知、公告、规划、征求意见稿，优先看政策文件、要闻、新闻发布、政策解读栏目，抓取发布日期与原文链接：
+请使用 Google 搜索，逐一检索以下 8 个官方网站「今天（{GEN_DATE}）新发布/新出台」的政策、通知、公告、规划、征求意见稿，优先看政策文件、要闻、新闻发布、政策解读栏目，抓取发布日期与原文链接：
 {site_lines}
 
 对每一条重要新政策，做深度解读，必须同时覆盖三个视角：
@@ -79,7 +84,7 @@ def build_prompt() -> str:
 输出结构：政策清单（标题 + 来源 + 发布日期 + 链接）+ 逐条「利好方向 / 利空方向 + 核心逻辑 + 持续性（短期/中期/长期）」。若某网站当日无重大新政策，明确标注「无重大新政策」。
 
 ## 二、全球事件与跨市场资金面分析
-使用联网搜索检索今日国际新闻、国际政策、地缘政治事件、重要科学论文/技术突破。分析这些外部变量对 A 股/港股/全球风险偏好的资金面影响（流入/流出、避险/risk-on），并判断持续性（一次性冲击 vs 趋势性变化）。
+使用 Google 搜索检索今日国际新闻、国际政策、地缘政治事件、重要科学论文/技术突破。分析这些外部变量对 A 股/港股/全球风险偏好的资金面影响（流入/流出、避险/risk-on），并判断持续性（一次性冲击 vs 趋势性变化）。
 
 ## 三、明日关注清单
 给出最值得跟踪的 3-5 个方向与对应触发信号。
@@ -87,77 +92,65 @@ def build_prompt() -> str:
 约束：仅基于公开信息分析，不提供个股买卖建议；区分「已落地政策」与「传闻/预期」。"""
 
 
-def _build_body(prompt: str) -> bytes:
-    # 使用 web_search 工具做实时联网检索（需模型支持；不支持时退化为纯知识回答）
+def call_gemini(prompt: str) -> str:
+    if not GEMINI_KEY:
+        raise RuntimeError("未配置 GEMINI_API_KEY，无法调用大模型。请在仓库 Secrets 中配置。")
+    keys = GEMINI_KEYS_LIST if GEMINI_KEYS_LIST else [GEMINI_KEY]
     body = {
-        "model": MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"googleSearch": {}}],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192, "topP": 0.95},
     }
-    # 仅当模型名暗示支持 web search 时才挂工具，避免在不支持的模型上报错
-    if "search" in MODEL.lower():
-        body["tools"] = [
-            {
-                "type": "web_search_preview",
-                "web_search_options": {"search_context_size": "high"},
-            }
-        ]
-    return json.dumps(body).encode("utf-8")
-
-
-def call_openai(prompt: str) -> str:
-    if not OPENAI_KEY:
-        raise RuntimeError("未配置 OPENAI_API_KEY，无法调用大模型。请在仓库 Secrets 中配置。")
-    keys = OPENAI_KEYS_LIST if OPENAI_KEYS_LIST else [OPENAI_KEY]
-    data = _build_body(prompt)
+    data = json.dumps(body).encode("utf-8")
+    # 依次尝试主模型与备选模型；每个模型在多个 key 间轮换，429 限流时退避重试
+    candidates = [MODEL] + MODEL_FALLBACKS
     last_err = None
     last_quota = False
-    for ki, key in enumerate(keys):
-        url = f"{BASE_URL}/chat/completions"
-        for attempt in range(1, 5):
-            try:
-                req = urllib.request.Request(
-                    url, data=data,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {key}",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    obj = json.loads(resp.read().decode("utf-8"))
-                content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if content and content.strip():
-                    print(f"[policy_scan] 模型 {MODEL}（key#{ki + 1}）生成成功")
-                    return content
-                raise RuntimeError("OpenAI 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
-            except urllib.error.HTTPError as e:
-                detail = ""
+    for model in candidates:
+        for ki, key in enumerate(keys):
+            url = f"{GEMINI_BASE_URL}/models/{model}:generateContent?key={key}"
+            for attempt in range(1, 5):
                 try:
-                    detail = e.read().decode("utf-8", errors="replace")[:800]
-                except Exception:
-                    pass
-                last_err = f"HTTP {e.code}: {detail}"
-                print(f"[policy_scan] 模型 {MODEL}（key#{ki + 1}）第 {attempt} 次失败: HTTP {e.code} {detail}", file=sys.stderr)
-                if e.code == 429:
-                    last_quota = True
-                    if ki < len(keys) - 1:
-                        break  # 换下一个 key
-                    time.sleep(min(60, 10 * attempt))
-                    continue
-                if 400 <= e.code < 500:
-                    # key 无效 / 模型不存在 / 不支持工具：尝试下一个 key（可能换了不同账号的 key）
-                    if ki < len(keys) - 1:
+                    req = urllib.request.Request(
+                        url, data=data, headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        obj = json.loads(resp.read().decode("utf-8"))
+                    parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts).strip()
+                    if text:
+                        print(f"[policy_scan] 模型 {model}（key#{ki + 1}）生成成功")
+                        return text
+                    raise RuntimeError("Gemini 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
+                except urllib.error.HTTPError as e:
+                    detail = ""
+                    try:
+                        detail = e.read().decode("utf-8", errors="replace")[:800]
+                    except Exception:
+                        pass
+                    last_err = f"HTTP {e.code}: {detail}"
+                    print(f"[policy_scan] 模型 {model}（key#{ki + 1}）第 {attempt} 次失败: HTTP {e.code} {detail}", file=sys.stderr)
+                    if e.code == 429:
+                        # 配额/限流：换下一个 key；若是最后一个 key 则退避后重试
+                        last_quota = True
+                        if ki < len(keys) - 1:
+                            break
+                        time.sleep(min(60, 10 * attempt))
+                        continue
+                    if 400 <= e.code < 500:
+                        # key 无效 / 模型不存在：换模型（同 key 重试无意义）
                         break
-                    raise RuntimeError(f"OpenAI 调用失败（客户端错误，请检查 OPENAI_API_KEY / OPENAI_MODEL / OPENAI_BASE_URL）: {last_err}")
-                time.sleep(min(30, 5 * attempt))
-                continue
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                print(f"[policy_scan] 模型 {MODEL}（key#{ki + 1}）第 {attempt} 次失败: {e}", file=sys.stderr)
-                time.sleep(min(30, 5 * attempt))
-                continue
-    hint = "（疑似 OpenAI 限流/配额 429，请确认账户余额或等待限流重置；可配置 OPENAI_API_KEYS 多 key 轮换）" if last_quota else ""
-    raise RuntimeError(f"OpenAI 调用失败（已尝试 key 数 {len(keys)}）: {last_err} {hint}")
+                    # 5xx 等服务端错误：退避重试
+                    time.sleep(min(30, 5 * attempt))
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    print(f"[policy_scan] 模型 {model}（key#{ki + 1}）第 {attempt} 次失败: {e}", file=sys.stderr)
+                    time.sleep(min(30, 5 * attempt))
+                    continue
+        # 该模型所有 key 均失败，尝试下一个模型
+    hint = "（疑似 Gemini API 配额耗尽 429，请等待配额重置或更换/升级 API Key）" if last_quota else ""
+    raise RuntimeError(f"Gemini 调用失败（已尝试模型 {candidates}，key 数 {len(keys)}）: {last_err} {hint}")
 
 
 def push_wechat(title: str, content: str) -> str:
@@ -212,9 +205,9 @@ def make_summary(report: str) -> str:
 
 
 def main() -> int:
-    print(f"[policy_scan] 开始生成 {GEN_DATE} 政策扫描报告，模型={MODEL}，base={BASE_URL}")
+    print(f"[policy_scan] 开始生成 {GEN_DATE} 政策扫描报告，模型={MODEL}")
     try:
-        report = call_openai(build_prompt())
+        report = call_gemini(build_prompt())
     except Exception as e:  # noqa: BLE001
         print(f"[policy_scan] 生成失败: {e}", file=sys.stderr)
         return 1
