@@ -11,9 +11,13 @@
 依赖：仅标准库 + requests（已在仓库 requirements.txt 中）
 环境变量：
   GEMINI_API_KEY    (必填，复用股票分析 Action 的同名 secret)
+  GEMINI_API_KEYS   (选填，多个 key 逗号分隔，429 限流时自动轮换)
   PUSHPLUS_TOKEN    (选填，填了就推微信；不填则只落盘)
   PUSHPLUS_TOPIC    (选填，一对多群组编码；填了则推给整个群组而非仅 token 本人)
   GEMINI_MODEL     (选填，默认 gemini-3-flash-preview，需支持 googleSearch grounding)
+  GEMINI_BASE_URL  (选填，中转网关地址；默认官方 https://generativelanguage.googleapis.com/v1beta
+                   地区受限（如中国大陆）无法直连官方时，可填 Gemini 兼容中转网关，
+                   接口格式与官方一致，googleSearch 联网检索仍可正常工作)
   POLICY_FORCE      (选填，任意非空则视为手动触发，即使非交易日也跑)
 """
 
@@ -47,6 +51,9 @@ if not GEMINI_KEY and GEMINI_KEYS_LIST:
 PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 PUSHPLUS_TOPIC = (os.environ.get("PUSHPLUS_TOPIC") or "").strip()  # 一对多群组编码；不填则推给 token 本人
 MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3-flash-preview").strip()
+# Gemini 接口基地址（中转网关可覆盖）。默认官方地址；地区受限无法直连时改为中转网关地址，
+# 例如 https://你的网关域名/v1beta 。接口路径与官方一致，googleSearch 联网检索同样可用。
+GEMINI_BASE_URL = (os.environ.get("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
 # 备选模型（按优先级）：仅保留 Google 仍在线、对 new users 可用的模型。
 # 注：gemini-2.5-flash / 2.5-pro / 1.5-flash 已对 new users 下架（404），故不再列入。
 MODEL_FALLBACKS = [m for m in [
@@ -101,7 +108,7 @@ def call_gemini(prompt: str) -> str:
     last_quota = False
     for model in candidates:
         for ki, key in enumerate(keys):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            url = f"{GEMINI_BASE_URL}/models/{model}:generateContent?key={key}"
             for attempt in range(1, 5):
                 try:
                     req = urllib.request.Request(
