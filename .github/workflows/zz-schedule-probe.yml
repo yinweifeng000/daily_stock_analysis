@@ -1,0 +1,17 @@
+name: Schedule Probe
+
+# 诊断专用：每 5 分钟一次，验证 fork 上 schedule 是否真正生效。确认后删除本文件。
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 打点
+        run: echo "schedule probe fired at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
