@@ -20,6 +20,7 @@
 import os
 import sys
 import json
+import time
 import datetime
 import urllib.request
 import urllib.error
@@ -37,18 +38,19 @@ SITES = [
 ]
 
 GEMINI_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
-if not GEMINI_KEY:
-    _keys = os.environ.get("GEMINI_API_KEYS", "").strip()
-    if _keys:
-        GEMINI_KEY = _keys.split(",")[0].strip()
+# 支持多个 key 轮换（环境变量 GEMINI_API_KEYS，逗号分隔），在 429 限流时自动切换
+_KEYS_RAW = (os.environ.get("GEMINI_API_KEYS") or "").strip()
+GEMINI_KEYS_LIST = [k.strip() for k in _KEYS_RAW.split(",") if k.strip()] if _KEYS_RAW else []
+if not GEMINI_KEY and GEMINI_KEYS_LIST:
+    GEMINI_KEY = GEMINI_KEYS_LIST[0]
 
 PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 PUSHPLUS_TOPIC = (os.environ.get("PUSHPLUS_TOPIC") or "").strip()  # 一对多群组编码；不填则推给 token 本人
 MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3-flash-preview").strip()
-# 备选模型（按优先级）：当主模型不可用（如已退役/改名返回 404）时自动切换。
-# daily_stock_analysis 项目当前主模型为 gemini-3-flash-preview，故将其放在首位。
+# 备选模型（按优先级）：仅保留 Google 仍在线、对 new users 可用的模型。
+# 注：gemini-2.5-flash / 2.5-pro / 1.5-flash 已对 new users 下架（404），故不再列入。
 MODEL_FALLBACKS = [m for m in [
-    "gemini-2.5-flash", "gemini-2.5-pro", "gemini-flash-latest", "gemini-1.5-flash",
+    "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-flash-latest",
 ] if m and m != MODEL]
 
 GEN_DATE = datetime.date.today().strftime("%Y-%m-%d")
@@ -86,44 +88,62 @@ def build_prompt() -> str:
 def call_gemini(prompt: str) -> str:
     if not GEMINI_KEY:
         raise RuntimeError("未配置 GEMINI_API_KEY，无法调用大模型。请在仓库 Secrets 中配置。")
+    keys = GEMINI_KEYS_LIST if GEMINI_KEYS_LIST else [GEMINI_KEY]
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "tools": [{"googleSearch": {}}],
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192, "topP": 0.95},
     }
     data = json.dumps(body).encode("utf-8")
-    # 依次尝试主模型与备选模型；4xx（key 无效/模型不存在）不重试，直接换下一个
+    # 依次尝试主模型与备选模型；每个模型在多个 key 间轮换，429 限流时退避重试
     candidates = [MODEL] + MODEL_FALLBACKS
     last_err = None
+    last_quota = False
     for model in candidates:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-        for attempt in range(1, 4):
-            try:
-                req = urllib.request.Request(
-                    url, data=data, headers={"Content-Type": "application/json"}
-                )
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    obj = json.loads(resp.read().decode("utf-8"))
-                parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts).strip()
-                if text:
-                    print(f"[policy_scan] 模型 {model} 生成成功")
-                    return text
-                raise RuntimeError("Gemini 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
-            except urllib.error.HTTPError as e:
-                detail = ""
+        for ki, key in enumerate(keys):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            for attempt in range(1, 5):
                 try:
-                    detail = e.read().decode("utf-8", errors="replace")[:800]
-                except Exception:
-                    pass
-                last_err = f"HTTP {e.code}: {detail}"
-                print(f"[policy_scan] 模型 {model} 第 {attempt} 次失败: HTTP {e.code} {detail}", file=sys.stderr)
-                if 400 <= e.code < 500:
-                    break  # 客户端错误，重试无意义
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                print(f"[policy_scan] 模型 {model} 第 {attempt} 次失败: {e}", file=sys.stderr)
-    raise RuntimeError(f"Gemini 调用失败（已尝试 {candidates}）: {last_err}")
+                    req = urllib.request.Request(
+                        url, data=data, headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        obj = json.loads(resp.read().decode("utf-8"))
+                    parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts).strip()
+                    if text:
+                        print(f"[policy_scan] 模型 {model}（key#{ki + 1}）生成成功")
+                        return text
+                    raise RuntimeError("Gemini 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
+                except urllib.error.HTTPError as e:
+                    detail = ""
+                    try:
+                        detail = e.read().decode("utf-8", errors="replace")[:800]
+                    except Exception:
+                        pass
+                    last_err = f"HTTP {e.code}: {detail}"
+                    print(f"[policy_scan] 模型 {model}（key#{ki + 1}）第 {attempt} 次失败: HTTP {e.code} {detail}", file=sys.stderr)
+                    if e.code == 429:
+                        # 配额/限流：换下一个 key；若是最后一个 key 则退避后重试
+                        last_quota = True
+                        if ki < len(keys) - 1:
+                            break
+                        time.sleep(min(60, 10 * attempt))
+                        continue
+                    if 400 <= e.code < 500:
+                        # key 无效 / 模型不存在：换模型（同 key 重试无意义）
+                        break
+                    # 5xx 等服务端错误：退避重试
+                    time.sleep(min(30, 5 * attempt))
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    print(f"[policy_scan] 模型 {model}（key#{ki + 1}）第 {attempt} 次失败: {e}", file=sys.stderr)
+                    time.sleep(min(30, 5 * attempt))
+                    continue
+        # 该模型所有 key 均失败，尝试下一个模型
+    hint = "（疑似 Gemini API 配额耗尽 429，请等待配额重置或更换/升级 API Key）" if last_quota else ""
+    raise RuntimeError(f"Gemini 调用失败（已尝试模型 {candidates}，key 数 {len(keys)}）: {last_err} {hint}")
 
 
 def push_wechat(title: str, content: str) -> str:
