@@ -286,7 +286,7 @@ def _inline(text: str) -> str:
         r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
         lambda m: (
             f'<a href="{m.group(2)}" '
-            f'style="color:#1677ff;text-decoration:none;border-bottom:1px solid #1677ff;'
+            f'style="color:#4dabf7;text-decoration:none;border-bottom:1px solid #4dabf7;'
             f'word-break:break-all;">{m.group(1)}</a>'
         ),
         text,
@@ -298,19 +298,19 @@ def _inline(text: str) -> str:
             return m.group(0)
         a = (
             f'<a href="{url}" '
-            f'style="color:#1677ff;text-decoration:none;border-bottom:1px solid #1677ff;'
+            f'style="color:#4dabf7;text-decoration:none;border-bottom:1px solid #4dabf7;'
             f'word-break:break-all;">{url}</a>'
         )
         return (pre or "") + a
 
     text = re.sub(r"(.)?(https?://[^\s<)]+)", _bare, text)
     # 3) 加粗 **x** -> 强调
-    text = re.sub(r"\*\*(.+?)\*\*", r'<strong style="font-weight:700;color:#222;">\1</strong>', text)
+    text = re.sub(r"\*\*(.+?)\*\*", r'<strong style="font-weight:700;color:#ffffff;">\1</strong>', text)
     # 4) 行内代码 `x`
     text = re.sub(
         r"`([^`]+)`",
-        r'<code style="background:#f2f2f2;padding:1px 4px;border-radius:3px;'
-        r'font-size:13px;color:#c0392b;">\1</code>',
+        r'<code style="background:#1e2128;padding:1px 4px;border-radius:3px;'
+        r'font-size:13px;color:#ff7b72;">\1</code>',
         text,
     )
     return text
@@ -340,7 +340,7 @@ def markdown_to_html(md: str) -> str:
         # 分隔线
         if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
             flush_list()
-            out.append('<hr style="border:none;border-top:1px solid #eee;margin:12px 0;">')
+            out.append('<hr style="border:none;border-top:1px solid #2a2f37;margin:12px 0;">')
             continue
         # 标题
         m = re.match(r"^(#{1,4})\s+(.*)$", line)
@@ -349,18 +349,18 @@ def markdown_to_html(md: str) -> str:
             level = len(m.group(1))
             txt = _inline(m.group(2))
             if level == 1:
-                out.append(f'<h1 style="font-size:20px;color:#d4380d;font-weight:700;border-bottom:2px solid #d4380d;padding-bottom:6px;margin:18px 0 10px;">{txt}</h1>')
+                out.append(f'<h1 style="font-size:20px;color:#ffa940;font-weight:700;border-bottom:2px solid #ffa940;padding-bottom:6px;margin:18px 0 10px;">{txt}</h1>')
             elif level == 2:
-                out.append(f'<h2 style="font-size:17px;color:#1f1f1f;font-weight:700;border-left:4px solid #d4380d;padding-left:8px;margin:16px 0 8px;">{txt}</h2>')
+                out.append(f'<h2 style="font-size:17px;color:#5cc8ff;font-weight:700;border-left:4px solid #ffa940;padding-left:8px;margin:16px 0 8px;">{txt}</h2>')
             elif level == 3:
-                out.append(f'<h3 style="font-size:15.5px;color:#d4380d;font-weight:700;margin:12px 0 6px;">{txt}</h3>')
+                out.append(f'<h3 style="font-size:15.5px;color:#ffa940;font-weight:700;margin:12px 0 6px;">{txt}</h3>')
             else:
-                out.append(f'<h4 style="font-size:14.5px;color:#444;font-weight:700;margin:10px 0 4px;">{txt}</h4>')
+                out.append(f'<h4 style="font-size:14.5px;color:#c9d1d9;font-weight:700;margin:10px 0 4px;">{txt}</h4>')
             continue
         # 引用
         if line.lstrip().startswith(">"):
             flush_list()
-            out.append(f'<div style="border-left:3px solid #d9d9d9;padding:4px 10px;color:#666;margin:6px 0;">{_inline(line.lstrip()[1:].strip())}</div>')
+            out.append(f'<div style="border-left:3px solid #3a4150;padding:4px 10px;color:#9aa3ad;background:rgba(255,255,255,0.04);margin:6px 0;">{_inline(line.lstrip()[1:].strip())}</div>')
             continue
         # 无序列表
         lm = re.match(r"^\s*[-*]\s+(.*)$", line)
@@ -384,10 +384,11 @@ def markdown_to_html(md: str) -> str:
     flush_list()
     body = "".join(out)
     wrapper = (
-        '<div style="max-width:100%;font-family:-apple-system,BlinkMacSystemFont,'
+        '<div style="max-width:100%;background:#111418;color:#e6e8eb;'
+        'font-family:-apple-system,BlinkMacSystemFont,'
         '&quot;PingFang SC&quot;,&quot;Helvetica Neue&quot;,Arial,sans-serif;'
-        'font-size:15px;line-height:1.7;color:#1f1f1f;word-break:break-word;'
-        'padding:2px 4px;">'
+        'font-size:15px;line-height:1.75;word-break:break-word;'
+        'padding:14px 14px 18px;border-radius:14px;">'
         f"{body}"
         "</div>"
     )
@@ -398,7 +399,7 @@ def make_summary(report: str) -> str:
     """兼容保留：返回整篇报告的手机 HTML（含全部章节），超长则截断保护。"""
     html = markdown_to_html(report)
     if len(html) > 40000:
-        html = html[:39000] + '<p style="color:#999;margin:6px 0;">（内容较长，已截断，完整版见仓库 policy_digest 目录）</p></div>'
+        html = html[:39000] + '<p style="color:#9aa3ad;margin:6px 0;">（内容较长，已截断，完整版见仓库 policy_digest 目录）</p></div>'
     return html
 
 
