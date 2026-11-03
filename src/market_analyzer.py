@@ -600,11 +600,23 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             logger.warning("[大盘] %s action=fetch_index_amounts status=failed error=%s", self._log_context(), e)
             return {}
 
+    def _norm_sector_name(self, name: str) -> str:
+        """板块名归一化：去空格/括号/常见后缀，便于跨数据源(东财/新浪)匹配。"""
+        if not name:
+            return ""
+        s = str(name).strip()
+        s = re.sub(r"[（(].*?[)）]", "", s)   # 去掉括号内容，如「半导体(申万)」
+        s = s.replace(" ", "").replace("　", "")
+        # 生成若干候选键：原文、去尾字「业/板块」等
+        return s
+
     def _fetch_sector_fund_flow(self) -> Dict[str, float]:
-        """从 akshare 获取板块主力净流入（亿元），返回 {板块名称: 主力净流入(亿元)}；失败返回空 dict。
+        """从 akshare 获取板块主力净流入（亿元），返回 {板块名称(归一化): 主力净流入(亿元)}；失败返回空 dict。
 
         注意：akshare 新版（>=1.13 左右）签名为 stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")，
         旧版签名为 stock_sector_fund_flow_rank(indicator="行业")。此处先按新版签名调用，失败时回退旧版。
+        同时兼容多种列名（「主力净流入」/「今日主力净流入-净额」等）与多种板块命名（东财/新浪），
+        并构建归一化键，便于与行业涨跌榜(可能来自新浪)的名称做容错匹配。
         """
         result: Dict[str, float] = {}
         try:
@@ -616,7 +628,15 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 except (TypeError, KeyError, ValueError):
                     return ak.stock_sector_fund_flow_rank(indicator=sector_type_old)
 
-            for sector_type_new, sector_type_old in (("行业资金流", "行业"), ("概念资金流", "概念")):
+            # 兼容更多签名组合（部分 akshare 版本对 sector_type 取值不同）
+            combos = [
+                ("行业资金流", "行业"),
+                ("概念资金流", "概念"),
+                ("地域资金流", "地域"),
+                ("行业", "行业"),
+                ("概念", "概念"),
+            ]
+            for sector_type_new, sector_type_old in combos:
                 try:
                     df = _fetch_df(sector_type_new, sector_type_old)
                 except Exception as e:
@@ -631,25 +651,78 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                         self._log_context(), sector_type_new,
                     )
                     continue
-                name_col = '名称' if '名称' in df.columns else next((c for c in df.columns if c in ('板块名称', '板块')), None)
-                net_col = next((c for c in df.columns if '主力净流入' in c and '净额' in c), None)
+                # 宽松匹配名称列
+                name_candidates = ("名称", "板块名称", "板块", "行业", "行业名称", "行业板块", "概念名称", "概念")
+                name_col = next((c for c in df.columns if c in name_candidates), None)
+                # 宽松匹配主力净流入列：优先「主力」+「净流入/净额」，其次任意含「净流入」或「主力净」的列
+                net_col = None
+                for c in df.columns:
+                    if "主力" in c and ("净流入" in c or "净额" in c):
+                        net_col = c
+                        break
+                if net_col is None:
+                    for c in df.columns:
+                        if "净流入" in c or "主力净" in c:
+                            net_col = c
+                            break
                 if not name_col or not net_col:
                     logger.warning(
                         "[大盘] %s action=fetch_sector_fund_flow sector=%s status=unexpected_columns columns=%s",
                         self._log_context(), sector_type_new, list(df.columns),
                     )
                     continue
+                logger.info(
+                    "[大盘] %s action=fetch_sector_fund_flow sector=%s status=ok rows=%d name_col=%s net_col=%s",
+                    self._log_context(), sector_type_new, len(df), name_col, net_col,
+                )
                 for _, row in df.iterrows():
                     nm = str(row[name_col]).strip()
                     try:
                         val = float(row[net_col]) / 1e8  # 元 -> 亿元
                     except (TypeError, ValueError):
                         continue
-                    if nm:
-                        result[nm] = result.get(nm, 0.0) + val
+                    if not nm:
+                        continue
+                    norm = self._norm_sector_name(nm)
+                    # 同时以原文与归一化键存储，提升跨源匹配命中率
+                    result[nm] = result.get(nm, 0.0) + val
+                    if norm and norm != nm:
+                        result[norm] = result.get(norm, 0.0) + val
         except Exception as e:
             logger.warning("[大盘] %s action=fetch_sector_fund_flow status=failed error=%s", self._log_context(), e)
+        if result:
+            logger.info(
+                "[大盘] %s action=fetch_sector_fund_flow status=success sample=%s",
+                self._log_context(),
+                dict(list(result.items())[:5]),
+            )
         return result
+
+    def _match_sector_flow(self, name: str, flow_map: Dict[str, float]):
+        """容错匹配板块主力净流入：原文 / 归一化 / 去尾字「业」「板块」等多候选；
+        仍无命中时，做保守的包含匹配（处理「X制造业」↔「X」这类后缀差异）。"""
+        if not name or not flow_map:
+            return None
+        cands = [
+            name,
+            name.strip(),
+            self._norm_sector_name(name),
+            name.rstrip("业"),
+            name.rstrip("板块"),
+            name.replace(" ", "").rstrip("业"),
+        ]
+        for c in cands:
+            if c and c in flow_map:
+                return flow_map[c]
+        # 保守包含匹配（仅当两者均较长，降低误匹配概率）
+        n = self._norm_sector_name(name)
+        if len(n) >= 4:
+            for k, v in flow_map.items():
+                kk = self._norm_sector_name(k)
+                if len(kk) >= 4 and (n.startswith(kk) or kk.startswith(n)
+                                     or n.endswith(kk) or kk.endswith(n)):
+                    return v
+        return None
 
     def _get_main_indices(self) -> List[MarketIndex]:
         """获取主要指数实时行情（成交额由 akshare 补充）"""
@@ -738,7 +811,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             flow_map = self._fetch_sector_fund_flow()
             for s in (top_sectors or []) + (bottom_sectors or []):
                 if isinstance(s, dict) and s.get('name'):
-                    s['main_net_inflow'] = flow_map.get(s['name'])
+                    s['main_net_inflow'] = self._match_sector_flow(s['name'], flow_map)
 
             if top_sectors or bottom_sectors:
                 overview.top_sectors = top_sectors
@@ -766,7 +839,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             flow_map = self._fetch_sector_fund_flow()
             for s in (top_concepts or []) + (bottom_concepts or []):
                 if isinstance(s, dict) and s.get('name'):
-                    s['main_net_inflow'] = flow_map.get(s['name'])
+                    s['main_net_inflow'] = self._match_sector_flow(s['name'], flow_map)
 
             if top_concepts or bottom_concepts:
                 overview.top_concepts = top_concepts
