@@ -13,7 +13,7 @@
   GEMINI_API_KEY    (必填，复用股票分析 Action 的同名 secret)
   PUSHPLUS_TOKEN    (选填，填了就推微信；不填则只落盘)
   PUSHPLUS_TOPIC    (选填，一对多群组编码；填了则推给整个群组而非仅 token 本人)
-  GEMINI_MODEL     (选填，默认 gemini-2.5-flash，需支持 googleSearch grounding)
+  GEMINI_MODEL     (选填，默认 gemini-3-flash-preview，需支持 googleSearch grounding)
   POLICY_FORCE      (选填，任意非空则视为手动触发，即使非交易日也跑)
 """
 
@@ -44,7 +44,12 @@ if not GEMINI_KEY:
 
 PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 PUSHPLUS_TOPIC = (os.environ.get("PUSHPLUS_TOPIC") or "").strip()  # 一对多群组编码；不填则推给 token 本人
-MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3-flash-preview").strip()
+# 备选模型（按优先级）：当主模型不可用（如已退役/改名返回 404）时自动切换。
+# daily_stock_analysis 项目当前主模型为 gemini-3-flash-preview，故将其放在首位。
+MODEL_FALLBACKS = [m for m in [
+    "gemini-2.5-flash", "gemini-2.5-pro", "gemini-flash-latest", "gemini-1.5-flash",
+] if m and m != MODEL]
 
 GEN_DATE = datetime.date.today().strftime("%Y-%m-%d")
 GEN_DATE_CN = f"{GEN_DATE}（北京时间）"
@@ -81,30 +86,44 @@ def build_prompt() -> str:
 def call_gemini(prompt: str) -> str:
     if not GEMINI_KEY:
         raise RuntimeError("未配置 GEMINI_API_KEY，无法调用大模型。请在仓库 Secrets 中配置。")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}"
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "tools": [{"googleSearch": {}}],
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192, "topP": 0.95},
     }
     data = json.dumps(body).encode("utf-8")
+    # 依次尝试主模型与备选模型；4xx（key 无效/模型不存在）不重试，直接换下一个
+    candidates = [MODEL] + MODEL_FALLBACKS
     last_err = None
-    for attempt in range(1, 4):
-        try:
-            req = urllib.request.Request(
-                url, data=data, headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                obj = json.loads(resp.read().decode("utf-8"))
-            parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            text = "".join(p.get("text", "") for p in parts).strip()
-            if text:
-                return text
-            raise RuntimeError("Gemini 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            print(f"[policy_scan] Gemini 调用第 {attempt} 次失败: {e}", file=sys.stderr)
-    raise RuntimeError(f"Gemini 调用失败: {last_err}")
+    for model in candidates:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        for attempt in range(1, 4):
+            try:
+                req = urllib.request.Request(
+                    url, data=data, headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    obj = json.loads(resp.read().decode("utf-8"))
+                parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    print(f"[policy_scan] 模型 {model} 生成成功")
+                    return text
+                raise RuntimeError("Gemini 返回空内容：" + json.dumps(obj, ensure_ascii=False)[:500])
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", errors="replace")[:800]
+                except Exception:
+                    pass
+                last_err = f"HTTP {e.code}: {detail}"
+                print(f"[policy_scan] 模型 {model} 第 {attempt} 次失败: HTTP {e.code} {detail}", file=sys.stderr)
+                if 400 <= e.code < 500:
+                    break  # 客户端错误，重试无意义
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"[policy_scan] 模型 {model} 第 {attempt} 次失败: {e}", file=sys.stderr)
+    raise RuntimeError(f"Gemini 调用失败（已尝试 {candidates}）: {last_err}")
 
 
 def push_wechat(title: str, content: str) -> str:
