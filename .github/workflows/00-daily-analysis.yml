@@ -1,12 +1,11 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 仅大盘复盘（北京时间 11:35 中午收盘 / 16:25 收盘后）
-  schedule:
-    - cron: '35 3 * * 1-5'     # 周一到周五，UTC 03:35 = 北京时间 11:35
-    - cron: '10 9 * * 1-5'     # 周一到周五，UTC 09:10 = 北京时间 17:10【测试】
-  
-  # 手动触发
+  # 【定时推送已关闭】本仓库（daily_stock_analysis）已停用，所有定时推送迁移到
+  # daily_stock_analysis_v2。此处不再配置 schedule，避免继续通过 PushPlus 推送微信。
+  # 如需运行，请在 Actions 页面手动触发 workflow_dispatch。
+
+  # 仅手动触发
   workflow_dispatch:
     inputs:
       mode:

@@ -1,9 +1,8 @@
 name: 每日政策扫描与宏观解读
 
 on:
-  # 北京时间每天 18:00（UTC 10:00）自动运行
-  schedule:
-    - cron: '0 10 * * *'
+  # 【定时推送已关闭】本仓库（daily_stock_analysis）已停用，定时推送迁移到
+  # daily_stock_analysis_v2。此处不再配置 schedule，避免继续通过 PushPlus 推送微信。
   # 允许手动触发
   workflow_dispatch:
     inputs:

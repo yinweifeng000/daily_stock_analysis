@@ -4,9 +4,7 @@
 name: Stale Issues & PRs
 
 on:
-  schedule:
-    # 每天 UTC 0:00（北京时间 8:00）检查一次
-    - cron: '0 0 * * *'
+  # 【定时已关闭】本仓库已停用，定时任务迁移到 daily_stock_analysis_v2
   # 支持手动触发
   workflow_dispatch:
 
